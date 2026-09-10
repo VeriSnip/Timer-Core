@@ -184,72 +184,86 @@ from the LPF and the power-on reset will still start the design on its own.
 
 ## Setting up
 
-`Timer-Core` does not vendor its dependencies. It expects two VeriSnip
-repositories cloned **next to** it, and the Makefile points at them from there:
-
-```
-SandBox/
-  Open-Library/     snippet generator scripts (MMIO.py, AXI.py, FSM.py, reg.py, ...)
-  Utils-Tool/       shell.nix and the make rules for simulation and boards
-  Timer-Core/       this repository
-```
-
-Clone all three into the same parent directory:
+[Nix](https://nixos.org/download) with a `nixpkgs` channel is the only host
+requirement. Clone this repository and enter the shell:
 
 ```bash
-git clone git@github.com:VeriSnip/Open-Library.git
-git clone git@github.com:VeriSnip/Utils-Tool.git
+git clone <this repository>
+cd Timer-Core
+nix-shell --run "make test"
 ```
 
-Two things depend on that layout:
+Nothing else needs cloning. Timer-Core depends on two VeriSnip repositories,
+and [shell.nix](shell.nix) pins both by revision and fetches them on demand:
 
-- `shell.nix` here is a symlink to `../Utils-Tool/shell.nix`, so `Utils-Tool`
-  has to exist before `nix-shell` will start at all.
-- `Open-Library` is passed to `vs_build` as an include directory, which is how
-  the generator scripts are found. Nothing is copied into this repository.
+```nix
+  utilsDir ? builtins.fetchGit {
+    url = "https://github.com/VeriSnip/Utils-Tool.git";
+    rev = "587407ffc6168b6803cb8f976af2a989a070c762";
+  },
+  openLibraryDir ? builtins.fetchGit {
+    url = "https://github.com/VeriSnip/Open-Library.git";
+    rev = "f46c9643799f279c201d482b457da9554f91ea6b";
+  },
+```
 
-Both paths are `?=` variables in the [Makefile](Makefile), so a different
-layout only needs them overridden:
+| Dependency     | Supplies                                                    |
+| -------------- | ----------------------------------------------------------- |
+| `Utils-Tool`   | `shell.nix` and the make rules for simulation and boards    |
+| `Open-Library` | generator scripts: `MMIO.py`, `AXI.py`, `FSM.py`, `reg.py`  |
+
+Pinning the revisions is the point: the generated RTL depends on what those
+scripts emit, so an unpinned dependency means a project that builds today can
+break tomorrow without a single local change.
+
+Entering the shell exports both paths:
+
+```bash
+$ nix-shell --run 'echo $Utils_DIR; echo $OpenLibrary_DIR'
+/nix/store/0b0i84rgcs1p4vqmq6r8pmwcg6dwwahw-source
+/nix/store/l9x5s55ynxbp74kmv2jgmm936svhrxh8-source
+```
+
+The [Makefile](Makefile) reads both with `?=`, so it uses those values without
+being told:
 
 ```make
-MyUtils_DIR ?= $(PWD)/../Utils-Tool
+Utils_DIR ?= $(PWD)/../Utils-Tool
 OpenLibrary_DIR ?= $(PWD)/../Open-Library
 ```
 
-```bash
-make test MyUtils_DIR=/path/to/Utils-Tool OpenLibrary_DIR=/path/to/Open-Library
-```
+`utils.mk` reads `Utils_DIR` under the same name and uses it to locate
+`Hardware.mk`, `Simulation/` and `Board/`.
 
-Those two cover the make side only. `shell.nix` is a relative symlink, so a
-`Utils-Tool` somewhere else needs it repointed as well:
+Because `include $(Utils_DIR)/utils.mk` is resolved when make parses, **run
+make from inside the shell** (`nix-shell --run "make ..."`, as above) rather
+than calling make directly. The literals in the Makefile are only a fallback
+for a checkout that does sit next to the two repositories.
 
-```bash
-ln -sf /path/to/Utils-Tool/shell.nix shell.nix
-```
+The first `nix-shell` needs network access and takes a few minutes: it fetches
+both repositories, realises the toolchain (`iverilog`, `verilator`, `verible`,
+`gtkwave`, `yosys`, `nextpnr`, `trellis`, `openFPGALoader`), then creates
+`.venv` here and `pip install`s VeriSnip and numpy into it. Later runs reuse
+the Nix store and `.venv` and start immediately. `.venv` is git-ignored;
+delete it to force a clean reinstall.
 
-### The nix-shell
+### Working on Open-Library or Utils-Tool
 
-Everything runs inside `nix-shell`, so [Nix](https://nixos.org/download) with a
-`nixpkgs` channel is the only host requirement. `Utils-Tool/shell.nix` brings
-in the whole toolchain — `iverilog`, `verilator`, `verible`, `gtkwave`,
-`yosys`, `nextpnr`, `trellis`, `openFPGALoader` — and its `shellHook` creates a
-`.venv` here and `pip install`s VeriSnip (0.0.5) and numpy into it.
-
-The first entry therefore needs network access and takes a few minutes; later
-ones reuse `.venv` and start immediately:
+To build against a local checkout instead of a pinned revision, override
+either argument:
 
 ```bash
-nix-shell
+nix-shell --arg openLibraryDir /path/to/Open-Library --run "make test"
+nix-shell --arg utilsDir /path/to/Utils-Tool --run "make test"
 ```
 
-```
-Entering pure nix-shell...
-Creating .venv...
-Installing verisnip via pip...
-Shell environment ready!
-```
+Once a change lands upstream, bump the matching `rev` in `shell.nix`.
 
-`.venv` is git-ignored. Delete it to force a clean reinstall.
+One gap remains: `Utils-Tool`'s `shellHook` runs an unpinned
+`pip install verisnip numpy`, so the `vs_build` version itself is not pinned by
+any of the above. Closing that means pinning the version in `Utils-Tool` or
+packaging VeriSnip as a Nix derivation.
+
 
 ## Building
 
@@ -258,10 +272,15 @@ nix-shell --run "make test"
 ```
 
 `make test` builds and simulates every testbench under `hardware/testbench`
-and lints its DUT. To work on one target only:
+and lints its DUT. It runs entirely inside the shell it was invoked from, so
+`--arg` overrides reach it:
 
 ```bash
-nix-shell --run "vs_build --clean timer --inc_dir=\$PWD/../Open-Library && make sim-run"
+nix-shell --arg openLibraryDir /path/to/Open-Library --run "make test"
+``` To work on one target only:
+
+```bash
+nix-shell --run "vs_build --clean timer --inc_dir=\$OpenLibrary_DIR && make sim-run"
 ```
 
 Add `VCD=1` to `make sim-run` to dump waves, and `DEBUG=1` for per-check
