@@ -1,0 +1,22 @@
+# iCESugar-Pro (Lattice ECP5 LFE5U-25F, CABGA256) pin assignment
+
+LOCATE COMP "clk_i" SITE "P6";
+IOBUF PORT "clk_i" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk_i" 25.0 MHz;
+
+# Reset button, active high. PULLMODE is set explicitly so an idle or
+# unconnected pin reads low (de-asserted) instead of taking the device default.
+# The wrapper also has an internal power-on reset, so if this pin turns out to
+# be driven high on your board you can simply delete both lines below.
+LOCATE COMP "arst_i" SITE "L14";
+IOBUF PORT "arst_i" IO_TYPE=LVCMOS33 PULLMODE=DOWN;
+
+# RGB LED. The bank is powered at 2.5 V, so these three use LVCMOS25 while the
+# clock and reset above stay on LVCMOS33. Only the channels selected by the
+# wrapper's LED_COLOUR parameter are driven; the rest are held dark.
+LOCATE COMP "led_r_o" SITE "B11";
+IOBUF PORT "led_r_o" IO_TYPE=LVCMOS25;
+LOCATE COMP "led_g_o" SITE "A11";
+IOBUF PORT "led_g_o" IO_TYPE=LVCMOS25;
+LOCATE COMP "led_b_o" SITE "A12";
+IOBUF PORT "led_b_o" IO_TYPE=LVCMOS25;

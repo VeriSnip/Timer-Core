@@ -1,0 +1,446 @@
+`timescale 1ns / 1ps
+
+`ifndef DEBUG
+`define DEBUG 0
+`endif
+
+// ============================================================================
+// Self-checking testbench for timer.
+//
+// Everything is driven through the AXI-Lite subordinate, the way a CPU or the
+// FPGA wrapper's control unit would: program Prescaler / Compare, clear the
+// counter, write Control. Each test then watches match_o and irq_o directly
+// and reads Status / Counter back over the bus, checking the timing against
+// the expected period (Compare + 1) * (Prescaler + 1).
+// ============================================================================
+module timer_tb ();
+
+  // --------------------------------------------------------------------------
+  // Parameters / memory map (byte addresses)
+  // --------------------------------------------------------------------------
+  localparam integer AXIL_ADDR_WIDTH = 32;
+  localparam integer AXIL_DATA_WIDTH = 32;
+  localparam integer COUNTER_WIDTH = 32;
+  localparam integer PRESCALER_WIDTH = 16;
+
+  localparam logic [31:0] RegControl = 32'h00;
+  localparam logic [31:0] RegStatus = 32'h04;
+  localparam logic [31:0] RegPrescaler = 32'h08;
+  localparam logic [31:0] RegCompare = 32'h0C;
+  localparam logic [31:0] RegCounter = 32'h10;
+
+  // Control register bits
+  localparam logic [31:0] CtrlEn = 32'h01;
+  localparam logic [31:0] CtrlCont = 32'h02;
+  localparam logic [31:0] CtrlClr = 32'h04;
+  localparam logic [31:0] CtrlIrq = 32'h08;
+  localparam logic [31:0] CtrlClrMatch = 32'h10;
+  // Bits the hardware clears again one cycle after the write
+  localparam logic [31:0] CtrlSelfClear = CtrlClr | CtrlClrMatch;
+
+  // Status register bits
+  localparam logic [31:0] StatRunning = 32'h01;
+  localparam logic [31:0] StatMatch = 32'h02;
+
+  localparam integer VERBOSE = `DEBUG;
+  localparam integer MaxRunTime = 4000;
+
+  // --------------------------------------------------------------------------
+  // Clock / reset
+  // --------------------------------------------------------------------------
+  logic clk = 0;
+  logic arst = 1;
+  always #5 clk = ~clk;
+
+  // --------------------------------------------------------------------------
+  // Scoreboard
+  // --------------------------------------------------------------------------
+  integer errors = 0;
+  integer checks = 0;
+
+  // Free running cycle count, used to measure the match period.
+  integer cycles = 0;
+  integer match_count = 0;
+  integer last_match_cycle = -1;
+  integer match_gap = 0;
+
+  always @(posedge clk) cycles <= cycles + 1;
+
+  always @(posedge clk) begin
+    if (match_o) begin
+      match_count <= match_count + 1;
+      if (last_match_cycle >= 0) match_gap <= cycles - last_match_cycle;
+      last_match_cycle <= cycles;
+    end
+  end
+
+  // --------------------------------------------------------------------------
+  // AXI-Lite subordinate stimulus
+  // --------------------------------------------------------------------------
+  logic AXIL_awvalid;
+  logic AXIL_awready;
+  logic [0:0] AXIL_awid;
+  logic [AXIL_ADDR_WIDTH-1:0] AXIL_awaddr;
+  logic AXIL_wvalid;
+  logic AXIL_wready;
+  logic [AXIL_DATA_WIDTH-1:0] AXIL_wdata;
+  logic [AXIL_DATA_WIDTH/8-1:0] AXIL_wstrb;
+  logic AXIL_bvalid;
+  logic AXIL_bready;
+  logic [0:0] AXIL_bid;
+  logic AXIL_arvalid;
+  logic AXIL_arready;
+  logic [0:0] AXIL_arid;
+  logic [AXIL_ADDR_WIDTH-1:0] AXIL_araddr;
+  logic AXIL_rvalid;
+  logic AXIL_rready;
+  logic [0:0] AXIL_rid;
+  logic [AXIL_DATA_WIDTH-1:0] AXIL_rdata;
+
+  logic match_o;
+  logic irq_o;
+
+  logic [AXIL_DATA_WIDTH-1:0] rdata;
+  logic [AXIL_DATA_WIDTH-1:0] rdata2;
+
+  // --------------------------------------------------------------------------
+  // DUT
+  // --------------------------------------------------------------------------
+  timer #(
+      .AXIL_ADDR_WIDTH(AXIL_ADDR_WIDTH),
+      .AXIL_DATA_WIDTH(AXIL_DATA_WIDTH),
+      .AXIL_ID_W_WIDTH(1),
+      .AXIL_ID_R_WIDTH(1),
+      .COUNTER_WIDTH(COUNTER_WIDTH),
+      .PRESCALER_WIDTH(PRESCALER_WIDTH),
+      .ADDR_WIDTH(AXIL_ADDR_WIDTH),
+      .DATA_WIDTH(AXIL_DATA_WIDTH)
+  ) dut (
+      .AXIL_awvalid_i(AXIL_awvalid),
+      .AXIL_awready_o(AXIL_awready),
+      .AXIL_awid_i   (AXIL_awid),
+      .AXIL_awaddr_i (AXIL_awaddr),
+      .AXIL_wvalid_i (AXIL_wvalid),
+      .AXIL_wready_o (AXIL_wready),
+      .AXIL_wdata_i  (AXIL_wdata),
+      .AXIL_wstrb_i  (AXIL_wstrb),
+      .AXIL_bvalid_o (AXIL_bvalid),
+      .AXIL_bready_i (AXIL_bready),
+      .AXIL_bid_o    (AXIL_bid),
+      .AXIL_arvalid_i(AXIL_arvalid),
+      .AXIL_arready_o(AXIL_arready),
+      .AXIL_arid_i   (AXIL_arid),
+      .AXIL_araddr_i (AXIL_araddr),
+      .AXIL_rvalid_o (AXIL_rvalid),
+      .AXIL_rready_i (AXIL_rready),
+      .AXIL_rid_o    (AXIL_rid),
+      .AXIL_rdata_o  (AXIL_rdata),
+      .clk_i         (clk),
+      .arstn_i       (~arst),
+      .match_o       (match_o),
+      .irq_o         (irq_o)
+  );
+
+  // --------------------------------------------------------------------------
+  // AXI-Lite driver tasks
+  // --------------------------------------------------------------------------
+  task automatic axil_write(input logic [AXIL_ADDR_WIDTH-1:0] addr,
+                            input logic [AXIL_DATA_WIDTH-1:0] data);
+    begin
+      @(negedge clk);
+      AXIL_awvalid = 1'b1;
+      AXIL_awaddr  = addr;
+      AXIL_awid    = 1'b0;
+      AXIL_wvalid  = 1'b1;
+      AXIL_wdata   = data;
+      AXIL_wstrb   = 4'hF;
+      @(negedge clk);
+      while (!(AXIL_awready && AXIL_wready)) @(negedge clk);
+      AXIL_awvalid = 1'b0;
+      AXIL_wvalid  = 1'b0;
+      AXIL_wstrb   = 4'h0;
+      while (!AXIL_bvalid) @(negedge clk);
+      // Let the write settle. Status and Counter are registered copies of the
+      // data plane and AXI-Lite registers rdata on top, so a read issued in
+      // the next cycle would still return the pre-write value.
+      repeat (2) @(posedge clk);
+    end
+  endtask
+
+  task automatic axil_read(input logic [AXIL_ADDR_WIDTH-1:0] addr,
+                           output logic [AXIL_DATA_WIDTH-1:0] data);
+    begin
+      @(negedge clk);
+      AXIL_arvalid = 1'b1;
+      AXIL_araddr  = addr;
+      AXIL_arid    = 1'b0;
+      @(negedge clk);
+      while (!AXIL_arready) @(negedge clk);
+      AXIL_arvalid = 1'b0;
+      while (!AXIL_rvalid) @(negedge clk);
+      data = AXIL_rdata;
+    end
+  endtask
+
+  // --------------------------------------------------------------------------
+  // Scoreboard helpers
+  // --------------------------------------------------------------------------
+  task automatic check_val(input string name, input logic [31:0] got,
+                           input logic [31:0] exp);
+    begin
+      checks = checks + 1;
+      if (got !== exp) begin
+        errors = errors + 1;
+        $display("[%0t] FAIL %-28s got 0x%08h expected 0x%08h", $time, name, got, exp);
+      end else if (VERBOSE) begin
+        $display("[%0t] pass %-28s 0x%08h", $time, name, got);
+      end
+    end
+  endtask
+
+  task automatic check_int(input string name, input integer got, input integer exp);
+    begin
+      checks = checks + 1;
+      if (got !== exp) begin
+        errors = errors + 1;
+        $display("[%0t] FAIL %-28s got %0d expected %0d", $time, name, got, exp);
+      end else if (VERBOSE) begin
+        $display("[%0t] pass %-28s %0d", $time, name, got);
+      end
+    end
+  endtask
+
+  // Reads its own scratch variable so it never clobbers a value under test.
+  task automatic check_reg(input string name, input logic [31:0] addr,
+                           input logic [31:0] exp);
+    logic [AXIL_DATA_WIDTH-1:0] got;
+    begin
+      axil_read(addr, got);
+      check_val(name, got, exp);
+    end
+  endtask
+
+  // --------------------------------------------------------------------------
+  // Reset
+  // --------------------------------------------------------------------------
+  task automatic do_reset;
+    begin
+      arst         = 1'b1;
+      AXIL_awvalid = 1'b0;
+      AXIL_awid    = 1'b0;
+      AXIL_awaddr  = 32'b0;
+      AXIL_wvalid  = 1'b0;
+      AXIL_wdata   = 32'b0;
+      AXIL_wstrb   = 4'b0;
+      AXIL_bready  = 1'b1;
+      AXIL_arvalid = 1'b0;
+      AXIL_arid    = 1'b0;
+      AXIL_araddr  = 32'b0;
+      AXIL_rready  = 1'b1;
+      repeat (4) @(posedge clk);
+      @(negedge clk);
+      arst = 1'b0;
+      repeat (2) @(posedge clk);
+      @(negedge clk);
+    end
+  endtask
+
+  // Program the timer and (re)start it from a known state.
+  task automatic program_timer(input logic [31:0] prescaler, input logic [31:0] compare,
+                               input logic [31:0] control);
+    begin
+      axil_write(RegControl, 32'h0);  // Stop before reprogramming
+      axil_write(RegPrescaler, prescaler);
+      axil_write(RegCompare, compare);
+      axil_write(RegControl, CtrlClr | CtrlClrMatch);  // Clear counter and flag
+      match_count = 0;
+      last_match_cycle = -1;
+      match_gap = 0;
+      axil_write(RegControl, control);
+    end
+  endtask
+
+  // --------------------------------------------------------------------------
+  // Tests
+  // --------------------------------------------------------------------------
+  task automatic test_reset_values;
+    begin
+      $display("-- Test 1: reset values --");
+      check_reg("reset Control", RegControl, 32'h0);
+      check_reg("reset Status", RegStatus, 32'h0);
+      check_reg("reset Prescaler", RegPrescaler, 32'h0);
+      check_reg("reset Compare", RegCompare, 32'h0);
+      check_reg("reset Counter", RegCounter, 32'h0);
+      check_val("reset match_o", {31'b0, match_o}, 32'h0);
+      check_val("reset irq_o", {31'b0, irq_o}, 32'h0);
+    end
+  endtask
+
+  task automatic test_register_access;
+    begin
+      $display("-- Test 2: register read/write --");
+      axil_write(RegPrescaler, 32'h0000_1234);
+      check_reg("Prescaler readback", RegPrescaler, 32'h0000_1234);
+      axil_write(RegCompare, 32'hDEAD_BEEF);
+      check_reg("Compare readback", RegCompare, 32'hDEAD_BEEF);
+
+      // Prescaler is PRESCALER_WIDTH wide, so the upper bits must not stick.
+      axil_write(RegPrescaler, 32'hFFFF_FFFF);
+      check_reg("Prescaler truncation", RegPrescaler, 32'h0000_FFFF);
+
+      // The two self-clearing Control bits must read back as zero.
+      axil_write(RegControl, CtrlCont | CtrlIrq);
+      check_reg("Control readback", RegControl, CtrlCont | CtrlIrq);
+      axil_write(RegControl, 32'h1F);
+      check_reg("Control self-clearing bits", RegControl, 32'h1F & ~CtrlSelfClear);
+
+      // Read-only registers must ignore writes.
+      axil_write(RegStatus, 32'hFFFF_FFFF);
+      axil_write(RegControl, 32'h0);
+      axil_write(RegControl, CtrlClr);
+      check_reg("Status is read-only", RegStatus, 32'h0);
+      axil_write(RegCounter, 32'hFFFF_FFFF);
+      check_reg("Counter is read-only", RegCounter, 32'h0);
+    end
+  endtask
+
+  task automatic test_one_shot;
+    begin
+      $display("-- Test 3: one-shot with prescaler --");
+      // Period = (Compare + 1) * (Prescaler + 1) = 6 * 4 = 24 cycles.
+      program_timer(32'd3, 32'd5, CtrlEn);
+      check_reg("one-shot Status running", RegStatus, StatRunning);
+
+      repeat (40) @(posedge clk);
+      check_int("one-shot match count", match_count, 1);
+      check_reg("one-shot Counter parked", RegCounter, 32'd5);
+      check_reg("one-shot Status matched", RegStatus, StatMatch);
+      check_val("one-shot irq_o masked", {31'b0, irq_o}, 32'h0);
+
+      // Unmasking the interrupt must expose the sticky flag.
+      axil_write(RegControl, CtrlEn | CtrlIrq);
+      @(negedge clk);
+      check_val("one-shot irq_o unmasked", {31'b0, irq_o}, 32'h1);
+
+      // The counter must stay parked: no further matches.
+      repeat (60) @(posedge clk);
+      check_int("one-shot stays parked", match_count, 1);
+
+      // Acknowledging the flag with the timer stopped clears Status entirely.
+      axil_write(RegControl, CtrlClrMatch);
+      check_reg("one-shot Status cleared", RegStatus, 32'h0);
+      check_val("one-shot irq_o cleared", {31'b0, irq_o}, 32'h0);
+    end
+  endtask
+
+  task automatic test_continuous;
+    begin
+      $display("-- Test 4: continuous mode period --");
+      // Period = (3 + 1) * (1 + 1) = 8 cycles.
+      program_timer(32'd1, 32'd3, CtrlEn | CtrlCont);
+      repeat (40) @(posedge clk);
+      check_int("continuous match period", match_gap, 8);
+      if (match_count < 4) begin
+        errors = errors + 1;
+        $display("[%0t] FAIL continuous match count: got %0d expected >= 4", $time,
+                 match_count);
+      end
+      checks = checks + 1;
+      check_reg("continuous Status", RegStatus, StatRunning | StatMatch);
+
+      $display("-- Test 5: prescaler bypass (Prescaler = 0) --");
+      // Period = (4 + 1) * (0 + 1) = 5 cycles.
+      program_timer(32'd0, 32'd4, CtrlEn | CtrlCont);
+      repeat (40) @(posedge clk);
+      check_int("bypass match period", match_gap, 5);
+
+      $display("-- Test 6: Compare = 0 matches every tick --");
+      program_timer(32'd2, 32'd0, CtrlEn | CtrlCont);
+      repeat (40) @(posedge clk);
+      check_int("Compare 0 match period", match_gap, 3);
+    end
+  endtask
+
+  task automatic test_clear_while_running;
+    begin
+      $display("-- Test 7: clear a running counter --");
+      program_timer(32'd0, 32'd10000, CtrlEn | CtrlCont);
+      repeat (60) @(posedge clk);
+      axil_read(RegCounter, rdata);
+      if (rdata < 32'd40) begin
+        errors = errors + 1;
+        $display("[%0t] FAIL running Counter advanced: got %0d expected >= 40", $time,
+                 rdata);
+      end
+      checks = checks + 1;
+
+      // Clearing is a one-shot bit: the counter restarts but keeps running.
+      axil_write(RegControl, CtrlEn | CtrlCont | CtrlClr);
+      check_reg("still running after clear", RegStatus, StatRunning);
+      axil_write(RegControl, 32'h0);
+      axil_read(RegCounter, rdata2);
+      if (rdata2 >= rdata) begin
+        errors = errors + 1;
+        $display("[%0t] FAIL Counter cleared: got %0d expected < %0d", $time, rdata2,
+                 rdata);
+      end
+      checks = checks + 1;
+    end
+  endtask
+
+  task automatic test_disable_freezes;
+    begin
+      $display("-- Test 8: disabling freezes the counter --");
+      program_timer(32'd0, 32'd10000, CtrlEn | CtrlCont);
+      repeat (30) @(posedge clk);
+      axil_write(RegControl, 32'h0);
+      axil_read(RegCounter, rdata);
+      repeat (30) @(posedge clk);
+      axil_read(RegCounter, rdata2);
+      check_val("Counter frozen while disabled", rdata2, rdata);
+      check_reg("Status not running", RegStatus, 32'h0);
+    end
+  endtask
+
+  // --------------------------------------------------------------------------
+  // Main stimulus
+  // --------------------------------------------------------------------------
+  initial begin
+    $display("==================================================");
+    $display(" timer testbench");
+    $display("==================================================");
+    do_reset;
+
+    test_reset_values;
+    test_register_access;
+    test_one_shot;
+    test_continuous;
+    test_clear_while_running;
+    test_disable_freezes;
+
+    repeat (4) @(posedge clk);
+    $display("==================================================");
+    $display(" Checks run : %0d", checks);
+    $display(" Errors     : %0d", errors);
+    if (errors == 0) $display(" RESULT     : PASS");
+    else $display(" RESULT     : FAIL");
+    $display("==================================================");
+    $finish;
+  end
+
+  // Watchdog
+  initial begin
+    repeat (MaxRunTime) @(posedge clk);
+    $display("[%0t] TIMEOUT: simulation did not finish in time", $time);
+    $finish;
+  end
+
+  // Dump waves. Off by default; enable with `make sim-run VCD=1`.
+`ifdef VCD
+  initial begin
+    $dumpfile("timer_tb.vcd");
+    $dumpvars(0, timer_tb);
+  end
+`endif
+
+endmodule
